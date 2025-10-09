@@ -1,0 +1,277 @@
+import argparse
+import logging
+import os
+import random
+import sys
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tensorboardX import SummaryWriter
+from torch.nn.modules.loss import CrossEntropyLoss
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from torchvision import transforms
+
+from test import args
+from utils import DiceLoss
+
+
+def worker_init_fn(worker_id):
+    random.seed(args.seed + worker_id)
+
+
+def fast_hist(a, b, n):
+    k = (a >= 0) & (a < n)
+    return np.bincount(n * a[k].astype(int) + b[k], minlength=n ** 2).reshape(n, n)
+
+
+def per_class_iu(hist):
+    return np.diag(hist) / np.maximum((hist.sum(1) + hist.sum(0) - np.diag(hist)), 1)
+
+
+def per_class_PA_Recall(hist):
+    return np.diag(hist) / np.maximum(hist.sum(1), 1)
+
+
+def per_class_Precision(hist):
+    return np.diag(hist) / np.maximum(hist.sum(0), 1)
+
+
+def per_Accuracy(hist):
+    return np.sum(np.diag(hist)) / np.maximum(np.sum(hist), 1)
+
+
+def per_class_F1(precision, recall):
+    return 2 * (precision * recall) / np.maximum((precision + recall), 1)
+
+
+def trainer_synapse(args, model, snapshot_path):
+    from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
+
+    start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+    logging.basicConfig(filename=os.path.join(snapshot_path, "log.txt"), level=logging.INFO,
+                        format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
+    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+    logging.info(f"Training started at {start_time}")
+    logging.info(str(args))
+
+    db_train = Synapse_dataset(
+        base_dir=args.root_path,
+        list_dir=args.list_dir,
+        split="train",
+        transform=transforms.Compose(
+            [RandomGenerator(output_size=[args.img_size, args.img_size])]))
+    print("The length of train set is: {}".format(len(db_train)))
+
+    db_val = Synapse_dataset(
+        base_dir='data/lidc-idri/val',
+        list_dir='lists/lists_Synapse1',
+        split="val",
+        transform=transforms.Compose(
+            [RandomGenerator(output_size=[args.img_size, args.img_size])]))
+    print("The length of validation set is: {}".format(len(db_val)))
+
+    trainloader = DataLoader(db_train, batch_size=args.batch_size * args.n_gpu, shuffle=True, num_workers=8,
+                             pin_memory=True,
+                             worker_init_fn=worker_init_fn)
+    valloader = DataLoader(db_val, batch_size=1, shuffle=False, num_workers=0, pin_memory=True,
+                           worker_init_fn=worker_init_fn)
+
+    if args.n_gpu > 1:
+        model = nn.DataParallel(model)
+
+    ce_loss = CrossEntropyLoss()
+    dice_loss = DiceLoss(args.num_classes)
+    optimizer = optim.SGD(model.parameters(), lr=args.base_lr, momentum=0.9, weight_decay=0.0001)
+    writer = SummaryWriter(os.path.join(snapshot_path, 'log'))
+    iter_num = 0
+    max_epoch = args.max_epochs
+    max_iterations = args.max_epochs * len(trainloader)
+    logging.info("{} iterations per epoch. {} max iterations ".format(len(trainloader), max_iterations))
+
+    min_val_loss = float('inf')
+    best_mIoU = 0.0
+    best_mPA = 0.0
+    best_precision = 0.0
+    best_accuracy = 0.0
+    best_mdice = 0.0
+    best_mF1 = 0.0
+
+    for epoch_num in tqdm(range(max_epoch), ncols=70):
+        model.train()
+        for i_batch, sampled_batch in enumerate(trainloader):
+            image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
+            image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
+            outputs = model(image_batch)
+            loss_ce = ce_loss(outputs, label_batch.long())
+            loss_dice = dice_loss(outputs, label_batch, softmax=True)
+            loss = 0.5 * loss_ce + 0.5 * loss_dice
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            lr_ = args.base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr_
+
+            iter_num += 1
+            writer.add_scalar('info/lr', lr_, iter_num)
+            writer.add_scalar('info/total_loss', loss, iter_num)
+            writer.add_scalar('info/loss_ce', loss_ce, iter_num)
+            writer.add_scalar('info/loss_dice', loss_dice, iter_num)
+            logging.info('Iteration %d : loss: %.6f, loss_ce: %.6f, loss_dice: %.6f' %
+                         (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
+
+            if iter_num % 20 == 0:
+                image = image_batch[0, 0:1, :, :]
+                image = (image - image.min()) / (image.max() - image.min())
+                writer.add_image('train/Image', image, iter_num)
+                outputs_vis = torch.argmax(torch.softmax(outputs, dim=1), dim=1, keepdim=True)
+                writer.add_image('train/Prediction', outputs_vis[0, ...] * 50, iter_num)
+                labs = label_batch[0, ...].unsqueeze(0) * 50
+                writer.add_image('train/GroundTruth', labs, iter_num)
+
+        save_interval = 50
+        if epoch_num > int(max_epoch / 2) and (epoch_num + 1) % save_interval == 0:
+            save_mode_path = os.path.join(snapshot_path, f'epoch_{epoch_num + 1}.pth')
+            torch.save(model.state_dict(), save_mode_path)
+            logging.info(f"Saved model to {save_mode_path}")
+
+        if (epoch_num + 1) % 5 == 0:
+            logging.info("Validation Start!")
+            val_loss, mIoU, mPA, precision, accuracy, mdice, mF1 = validate(model, valloader, args.num_classes, ce_loss,
+                                                                            dice_loss)
+
+            if val_loss < min_val_loss:
+                min_val_loss = val_loss
+                save_mode_path = os.path.join(snapshot_path, 'best_val_loss.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info(f"Saved best validation loss model to {save_mode_path} with val_loss: {min_val_loss:.4f}")
+
+            if mIoU > best_mIoU:
+                best_mIoU = mIoU
+                save_mode_path = os.path.join(snapshot_path, 'best_mIoU.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info(f"Saved best mIoU model to {save_mode_path} with mIoU: {best_mIoU * 100:.2f}")
+
+            if mPA > best_mPA:
+                best_mPA = mPA
+                save_mode_path = os.path.join(snapshot_path, 'best_mPA.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info(f"Saved best mPA model to {save_mode_path} with mPA: {best_mPA * 100:.2f}")
+
+            if precision > best_precision:
+                best_precision = precision
+                save_mode_path = os.path.join(snapshot_path, 'best_precision.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info(
+                    f"Saved best Precision model to {save_mode_path} with Precision: {best_precision * 100:.2f}")
+
+            if accuracy > best_accuracy:
+                best_accuracy = accuracy
+                save_mode_path = os.path.join(snapshot_path, 'best_accuracy.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info(f"Saved best Accuracy model to {save_mode_path} with Accuracy: {best_accuracy * 100:.2f}")
+
+            if mdice > best_mdice:
+                best_mdice = mdice
+                save_mode_path = os.path.join(snapshot_path, 'best_mdice.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info(f"Saved best mDice model to {save_mode_path} with mDice: {best_mdice * 100:.2f}")
+
+            if mF1 > best_mF1:
+                best_mF1 = mF1
+                save_mode_path = os.path.join(snapshot_path, 'best_mF1.pth')
+                torch.save(model.state_dict(), save_mode_path)
+                logging.info(f"Saved best mF1 model to {save_mode_path} with mF1: {best_mF1 * 100:.2f}")
+
+            writer.add_scalar('val/best_mIoU', best_mIoU, epoch_num + 1)
+            writer.add_scalar('val/best_mPA', best_mPA, epoch_num + 1)
+            writer.add_scalar('val/best_precision', best_precision, epoch_num + 1)
+            writer.add_scalar('val/best_accuracy', best_accuracy, epoch_num + 1)
+            writer.add_scalar('val/best_mdice', best_mdice, epoch_num + 1)
+            writer.add_scalar('val/best_mF1', best_mF1, epoch_num + 1)
+
+        if epoch_num >= max_epoch - 1:
+            save_mode_path = os.path.join(snapshot_path, f'epoch_{epoch_num + 1}.pth')
+            torch.save(model.state_dict(), save_mode_path)
+            logging.info(f"Saved model to {save_mode_path}")
+            break
+
+    logging.info("Training completed.")
+    logging.info(f"Best mIoU: {best_mIoU * 100:.2f}")
+    logging.info(f"Best mPA: {best_mPA * 100:.2f}")
+    logging.info(f"Best Precision: {best_precision * 100:.2f}")
+    logging.info(f"Best Accuracy: {best_accuracy * 100:.2f}")
+    logging.info(f"Best mDice: {best_mdice * 100:.2f}")
+    logging.info(f"Best mF1: {best_mF1 * 100:.2f}")
+
+    writer.close()
+    return "Training Finished!"
+
+
+def validate(model, valloader, num_classes, ce_loss, dice_loss):
+    model.eval()
+    val_loss = 0
+    val_loss_ce = 0
+    val_loss_dice = 0
+    hist = np.zeros((num_classes, num_classes))
+    dice_scores = []
+    precision_scores = []
+    recall_scores = []
+    f1_scores = []
+
+    for sampled_batch in tqdm(valloader):
+        image_batch, label_batch = sampled_batch['image'], sampled_batch['label']
+        image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
+        with torch.no_grad():
+            outputs = model(image_batch)
+            loss_ce = ce_loss(outputs, label_batch.long())
+            loss_dice = dice_loss(outputs, label_batch, softmax=True)
+            loss = 0.5 * loss_ce + 0.5 * loss_dice
+            val_loss += loss.item()
+            val_loss_ce += loss_ce.item()
+            val_loss_dice += loss_dice.item()
+
+            out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0)
+            out = out.cpu().detach().numpy()
+            label = label_batch.cpu().squeeze().numpy()
+
+            hist += fast_hist(label.flatten(), out.flatten(), num_classes)
+
+            true_positive = np.diag(hist)
+            predicted_positive = hist.sum(0)
+            actual_positive = hist.sum(1)
+
+            precision = true_positive / np.maximum(predicted_positive, 1)
+            recall = true_positive / np.maximum(actual_positive, 1)
+
+            precision_scores.append(precision)
+            recall_scores.append(recall)
+
+            dice_scores.append(1 - loss_dice.item())
+
+    IoUs = per_class_iu(hist)
+    PA_Recall = per_class_PA_Recall(hist)
+    Precision = per_class_Precision(hist)
+
+    mIoU = np.nanmean(IoUs)
+    mPA = np.nanmean(PA_Recall)
+    accuracy = per_Accuracy(hist)
+
+    mdice = np.mean(dice_scores)
+
+    mean_precision = np.nanmean(Precision)
+    mean_recall = np.nanmean(PA_Recall)
+
+    F1 = per_class_F1(Precision, PA_Recall)
+    mF1 = np.nanmean(F1)
+
+    logging.info(
+        'Validation Results - Loss: {:.4f}, CE Loss: {:.4f}, Dice Loss: {:.4f}, mIoU: {:.2f}, mPA: {:.2f}, Precision: {:.2f}, Accuracy: {:.2f}, mDice: {:.2f}, mF1: {:.2f}'.format(
+            val_loss, val_loss_ce, val_loss_dice, mIoU * 100, mPA * 100, mean_precision * 100, accuracy * 100, mdice * 100, mF1 * 100))
+
+    return val_loss, mIoU, mPA, mean_precision, accuracy, mdice, mF1
